@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-note-cards",
+  "version": "0.1.0",
+  "description": "Compact card view for notes on Obsidian canvas",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "dev": "esbuild main.ts --bundle --external:obsidian --external:electron --format=cjs --target=es2020 --sourcemap=inline --outfile=main.js --watch",
+    "build": "tsc --noEmit && esbuild main.ts --bundle --external:obsidian --external:electron --format=cjs --target=es2020 --minify --outfile=main.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.13.1",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "monkey-around": "^3.0.0"
+  }
+}

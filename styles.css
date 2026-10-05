@@ -1,0 +1,47 @@
+/* Card view: hide the embedded note and its label, show the title overlay instead */
+.canvas-node.is-note-card .canvas-node-content,
+.canvas-node.is-note-card .canvas-node-content-blocker,
+.canvas-node.is-note-card .canvas-node-placeholder,
+.canvas-node.is-note-card .canvas-node-label {
+	display: none;
+}
+
+.note-card {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: var(--size-4-2) var(--size-4-4);
+}
+
+.note-card-title {
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 3;
+	overflow: hidden;
+	overflow-wrap: anywhere;
+	text-align: center;
+	font-size: var(--font-ui-large);
+	font-weight: var(--font-semibold);
+	line-height: var(--line-height-tight);
+}
+
+.note-card-actions {
+	position: absolute;
+	top: var(--size-2-2);
+	right: var(--size-2-2);
+	display: none;
+	gap: var(--size-2-1);
+	border-radius: var(--radius-s);
+	background-color: var(--background-primary);
+	box-shadow: var(--shadow-s);
+}
+
+.note-card:hover .note-card-actions {
+	display: flex;
+}
+
+.modal.note-card-preview {
+	width: min(800px, 90vw);
+}

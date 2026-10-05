@@ -3,7 +3,7 @@ import {
 	App,
 	Component,
 	ItemView,
-	MarkdownRenderer,
+	MarkdownFileInfo,
 	Menu,
 	Modal,
 	Notice,
@@ -13,9 +13,12 @@ import {
 	TFile,
 	WorkspaceLeaf,
 	normalizePath,
+	parseLinktext,
 	resolveSubpath,
 	setIcon,
 	setTooltip,
+	stripHeading,
+	stripHeadingForLink,
 } from "obsidian";
 
 type NodeView = "note" | "card";
@@ -49,13 +52,35 @@ interface CanvasNode {
 	height: number;
 	unknownData: Record<string, unknown>;
 	resize(size: Size): void;
+	attach(): void;
 	render(): void;
 	setData(data: unknown): void;
+	setIsEditing(editing: boolean): void;
+	startEditing(...args: unknown[]): void;
 	// file nodes only
+	isEditing?: boolean;
 	file?: TFile | null;
 	filePath?: string;
 	subpath?: string;
+	child?: Partial<MarkdownEmbed> | null;
+	setFilePath?(path: string, subpath: string): void;
 }
+/** The editable note widget canvas itself embeds into file nodes. */
+interface MarkdownEmbed extends Component {
+	editable: boolean;
+	loadFile(): Promise<void>;
+	showEditor(): void;
+	showPreview(save?: boolean): void;
+	focusTitle(): void;
+}
+interface SubpathUpdater {
+	renameSubpath?(file: TFile, oldSubpath: string, newSubpath: string): Promise<void>;
+}
+type EmbedCreator = (
+	ctx: { app: App; linktext: string; sourcePath: string; containerEl: HTMLElement; depth: number },
+	file: TFile,
+	subpath: string,
+) => MarkdownEmbed;
 interface CanvasMenu {
 	canvas: Canvas;
 	menuEl: HTMLElement;
@@ -70,9 +95,12 @@ interface Canvas {
 	menu: CanvasMenu;
 	config: { defaultFileNodeDimensions: Size };
 	posCenter(): Pos;
-	createFileNode(opts: { pos: Pos; size?: Size; position?: string; file: TFile }): CanvasNode;
+	createFileNode(opts: { pos: Pos; size?: Size; position?: string; file: TFile; save?: boolean }): CanvasNode;
 	dragTempNode(evt: PointerEvent, size: Size, onDrop: (pos: Pos) => void): void;
+	showCreationMenu(menu: Menu, pos: Pos, size?: Size): void;
 	addNode(node: CanvasNode): void;
+	removeNode(node: CanvasNode): void;
+	selectOnly(node: CanvasNode): void;
 	requestSave(): void;
 }
 
@@ -80,14 +108,48 @@ function isNoteNode(node: CanvasNode): boolean {
 	return node.filePath !== undefined && node.file?.extension === "md";
 }
 
+/** "#Heading" or "#Parent#Child", but not a block reference ("#^id"). */
+function isHeadingSubpath(subpath: string | undefined): subpath is string {
+	return !!subpath && subpath.startsWith("#") && !subpath.startsWith("#^");
+}
+
 function cardTitle(node: CanvasNode): string {
-	const subpath = node.subpath ?? "";
-	// "#Heading" or "#Parent#Child" - block references ("#^id") fall back to the file name
-	if (subpath.startsWith("#") && !subpath.startsWith("#^")) {
-		const heading = subpath.split("#").pop();
+	if (isHeadingSubpath(node.subpath)) {
+		const heading = node.subpath.split("#").pop();
 		if (heading) return heading;
 	}
 	return node.file?.basename ?? node.filePath ?? "";
+}
+
+interface TextEdit {
+	start: number;
+	end: number;
+	/** Gets the text currently in the range; null leaves it untouched. */
+	replace(current: string): string | null;
+}
+
+function applyEdits(data: string, edits: TextEdit[]): string {
+	// back to front, so earlier offsets stay valid
+	for (const edit of [...edits].sort((a, b) => b.start - a.start)) {
+		const text = edit.replace(data.slice(edit.start, edit.end));
+		if (text !== null) data = data.slice(0, edit.start) + text + data.slice(edit.end);
+	}
+	return data;
+}
+
+/** Swaps the target inside a link's source text, keeping its style (wikilink/markdown, alias, embed). */
+function rewriteLink(original: string, link: string, newLink: string): string | null {
+	// markdown links carry the target URL-encoded
+	const encodings = [(text: string) => text, encodeURI, (text: string) => text.replace(/ /g, "%20")];
+	for (const encode of encodings) {
+		const from = encode(link);
+		if (original.includes(from)) return original.replace(from, () => encode(newLink));
+	}
+	return null;
+}
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
 }
 
 export default class NoteCardsPlugin extends Plugin {
@@ -128,6 +190,8 @@ export default class NoteCardsPlugin extends Plugin {
 			}),
 		);
 
+		// canvas does not re-render a node when its file is renamed, so card titles would go stale
+		this.registerEvent(this.app.vault.on("rename", () => this.refreshAll()));
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.setupCanvases()));
 		this.app.workspace.onLayoutReady(() => this.setupCanvases());
 	}
@@ -196,6 +260,19 @@ export default class NoteCardsPlugin extends Plugin {
 						plugin.patchNode(node);
 					};
 				},
+				// right-click menu on empty canvas space
+				showCreationMenu(next) {
+					return function (this: Canvas, menu: Menu, pos: Pos, size?: Size) {
+						next.call(this, menu, pos, size);
+						menu.addItem((item) =>
+							item
+								.setSection("create")
+								.setTitle("Add note")
+								.setIcon("file-plus")
+								.onClick(() => void plugin.addNewNote(this, pos, false)),
+						);
+					};
+				},
 			}),
 		);
 		this.register(
@@ -232,6 +309,13 @@ export default class NoteCardsPlugin extends Plugin {
 						plugin.syncNode(this);
 					};
 				},
+				// "Edit" in the selection toolbar / context menu, Enter key
+				startEditing(next) {
+					return function (this: CanvasNode, ...args: unknown[]) {
+						if (plugin.isCard(this)) plugin.editCardTitle(this);
+						else next.apply(this, args);
+					};
+				},
 			}),
 		);
 		this.refreshAll();
@@ -258,10 +342,14 @@ export default class NoteCardsPlugin extends Plugin {
 		}
 	}
 
+	private isCard(node: CanvasNode): boolean {
+		return isNoteNode(node) && this.viewOf(node) === "card";
+	}
+
 	private syncNode(node: CanvasNode) {
 		const container = node.containerEl;
 		if (!container) return; // not initialized yet, render() will get back to us
-		const isCard = isNoteNode(node) && this.viewOf(node) === "card";
+		const isCard = this.isCard(node);
 		node.nodeEl.toggleClass("is-note-card", isCard);
 
 		let cardEl = container.querySelector<HTMLElement>(":scope > .note-card");
@@ -270,7 +358,8 @@ export default class NoteCardsPlugin extends Plugin {
 			return;
 		}
 		cardEl ??= this.buildCard(node, container);
-		cardEl.querySelector(".note-card-title")?.setText(cardTitle(node));
+		const titleEl = cardEl.querySelector<HTMLElement>(".note-card-title");
+		if (titleEl && !titleEl.isContentEditable) titleEl.setText(cardTitle(node));
 	}
 
 	private buildCard(node: CanvasNode, container: HTMLElement): HTMLElement {
@@ -279,7 +368,7 @@ export default class NoteCardsPlugin extends Plugin {
 		cardEl.addEventListener("dblclick", (evt) => {
 			// the node would otherwise start editing the (hidden) embedded note
 			evt.preventDefault();
-			if (node.file) void this.goToDocument(node.file, node.subpath ?? "");
+			if (node.file && !node.isEditing) new NoteModal(this.app, node.file, node.subpath ?? "").open();
 		});
 
 		const actions = cardEl.createDiv("note-card-actions");
@@ -295,7 +384,7 @@ export default class NoteCardsPlugin extends Plugin {
 				if (node.file) onClick(node.file);
 			});
 		};
-		addAction("eye", "Preview", (file) => new PreviewModal(this.app, file, node.subpath ?? "").open());
+		addAction("eye", "Preview", (file) => new NoteModal(this.app, file, node.subpath ?? "").open());
 		addAction("file-symlink", "Go to document", (file) => void this.goToDocument(file, node.subpath ?? ""));
 		return cardEl;
 	}
@@ -309,6 +398,181 @@ export default class NoteCardsPlugin extends Plugin {
 		leaf ??= this.app.workspace.getLeaf("tab");
 		await leaf.openFile(file, { active: true, eState: subpath ? { subpath } : undefined });
 		await this.app.workspace.revealLeaf(leaf);
+	}
+
+	// --- editing the card title --------------------------------------------
+
+	/**
+	 * Turns the card title into an inline text field. Enter or clicking away
+	 * commits, Esc cancels; an empty entry counts as cancel.
+	 */
+	private startTitleEdit(node: CanvasNode, initial: string, onCommit: (text: string) => void, onCancel?: () => void) {
+		const titleEl = node.containerEl?.querySelector<HTMLElement>(":scope > .note-card > .note-card-title");
+		if (!titleEl || titleEl.isContentEditable) return;
+
+		node.canvas.selectOnly(node);
+		node.setIsEditing(true);
+		titleEl.setText(initial);
+		titleEl.contentEditable = "plaintext-only";
+		titleEl.focus();
+		titleEl.win.getSelection()?.selectAllChildren(titleEl);
+
+		const listeners = new AbortController();
+		const finish = (commit: boolean) => {
+			if (listeners.signal.aborted) return;
+			listeners.abort();
+			const text = titleEl.getText().replace(/\s+/g, " ").trim();
+			titleEl.contentEditable = "false";
+			titleEl.blur();
+			node.setIsEditing(false);
+			this.syncNode(node);
+			if (commit && text) onCommit(text);
+			else onCancel?.();
+		};
+		const on = <K extends keyof HTMLElementEventMap>(type: K, handler: (evt: HTMLElementEventMap[K]) => void) =>
+			titleEl.addEventListener(type, handler, { signal: listeners.signal });
+
+		on("keydown", (evt) => {
+			if (evt.isComposing) return;
+			if (evt.key === "Enter" || evt.key === "Escape") {
+				evt.preventDefault();
+				evt.stopPropagation();
+				finish(evt.key === "Enter");
+			}
+		});
+		on("blur", () => finish(true));
+		// let the mouse place the caret instead of dragging the node or opening the modal
+		on("pointerdown", (evt) => evt.stopPropagation());
+		on("dblclick", (evt) => evt.stopPropagation());
+	}
+
+	/** Renames what the card shows: the heading it is narrowed to, otherwise the file. */
+	private editCardTitle(node: CanvasNode) {
+		const file = node.file;
+		if (!file || node.canvas.readonly) return;
+		if (isHeadingSubpath(node.subpath)) {
+			const heading = this.resolveHeading(file, node.subpath);
+			this.startTitleEdit(node, heading?.heading ?? cardTitle(node), (text) => void this.renameHeading(node, file, text));
+		} else {
+			this.startTitleEdit(node, file.basename, (text) => void this.renameFile(file, text));
+		}
+	}
+
+	private async renameFile(file: TFile, name: string) {
+		if (name === file.basename) return;
+		const folder = file.parent && !file.parent.isRoot() ? `${file.parent.path}/` : "";
+		const path = normalizePath(`${folder}${name}.${file.extension}`);
+		if (this.app.vault.getAbstractFileByPath(path)) {
+			new Notice(`"${name}" already exists.`);
+			return;
+		}
+		try {
+			await this.app.fileManager.renameFile(file, path);
+		} catch (err) {
+			new Notice(`Could not rename note: ${errorMessage(err)}`);
+		}
+	}
+
+	private resolveHeading(file: TFile, subpath: string) {
+		const cache = this.app.metadataCache.getFileCache(file);
+		const result = cache ? resolveSubpath(cache, subpath) : null;
+		return result?.type === "heading" ? result.current : null;
+	}
+
+	/**
+	 * Same effect as Obsidian's "Rename this heading": rewrites the heading in the note,
+	 * every link to it across the vault, and canvas cards narrowed to it.
+	 */
+	private async renameHeading(node: CanvasNode, file: TFile, text: string) {
+		const { vault, metadataCache } = this.app;
+		const oldSubpath = node.subpath ?? "";
+		const heading = this.resolveHeading(file, oldSubpath);
+		if (!heading) {
+			new Notice("Could not find the heading in the note.");
+			return;
+		}
+		if (heading.heading === text) return;
+		// Obsidian matches heading links on this normalized form
+		const oldKey = stripHeading(heading.heading).toLowerCase();
+		const newLink = stripHeadingForLink(text);
+		const pointsAtHeading = (subpath: string | undefined) =>
+			isHeadingSubpath(subpath) && stripHeading(subpath.substring(1)).toLowerCase() === oldKey;
+
+		// links to the heading, per source file
+		const edits = new Map<TFile, TextEdit[]>();
+		let linkCount = 0;
+		for (const source of vault.getMarkdownFiles()) {
+			const cache = metadataCache.getFileCache(source);
+			for (const ref of [...(cache?.links ?? []), ...(cache?.embeds ?? [])]) {
+				const { path, subpath } = parseLinktext(ref.link);
+				if (!pointsAtHeading(subpath)) continue;
+				const target = path ? metadataCache.getFirstLinkpathDest(path, source.path) : source;
+				if (target !== file) continue;
+				const updated = rewriteLink(ref.original, ref.link, `${path}#${newLink}`);
+				if (!updated) continue;
+				const list = edits.get(source) ?? [];
+				list.push({
+					start: ref.position.start.offset,
+					end: ref.position.end.offset,
+					// skip if the file changed under a stale cache
+					replace: (current) => (current === ref.original ? updated : null),
+				});
+				edits.set(source, list);
+				linkCount++;
+			}
+		}
+
+		// the heading itself goes first, together with the links inside the same note
+		let renamed = false;
+		const headingEdit: TextEdit = {
+			start: heading.position.start.offset,
+			end: heading.position.end.offset,
+			replace: (current) => {
+				const match = /^(\s*#{1,6}\s+)/.exec(current);
+				renamed = !!match;
+				return match ? match[1] + text : null;
+			},
+		};
+		const ownEdits = [headingEdit, ...(edits.get(file) ?? [])];
+		edits.delete(file);
+		await vault.process(file, (data) => {
+			const result = applyEdits(data, ownEdits);
+			return renamed ? result : data;
+		});
+		if (!renamed) {
+			new Notice("Could not rename the heading.");
+			return;
+		}
+		for (const [source, list] of edits) {
+			await vault.process(source, (data) => applyEdits(data, list));
+		}
+
+		// open canvases are updated in memory, so unsaved changes in them are not lost...
+		const parts = oldSubpath.split("#");
+		parts[parts.length - 1] = newLink;
+		const nestedSubpath = parts.join("#");
+		for (const canvas of this.canvases()) {
+			let changed = false;
+			for (const other of canvas.nodes.values()) {
+				if (other.file !== file || !other.filePath) continue;
+				const next = other.subpath === oldSubpath ? nestedSubpath : pointsAtHeading(other.subpath) ? `#${newLink}` : null;
+				if (next === null) continue;
+				other.setFilePath?.(other.filePath, next);
+				changed = true;
+			}
+			if (changed) canvas.requestSave();
+		}
+		// ...and Obsidian's own canvas link updater takes care of the canvas files on disk
+		const updaters = (metadataCache as unknown as { linkUpdaters?: Record<string, SubpathUpdater> }).linkUpdaters ?? {};
+		for (const updater of Object.values(updaters)) {
+			try {
+				await updater.renameSubpath?.(file, oldKey, newLink);
+			} catch (err) {
+				console.error("Note Cards: could not update canvas files", err);
+			}
+		}
+
+		if (linkCount) new Notice(`Updated ${linkCount} link${linkCount === 1 ? "" : "s"} to the heading.`);
 	}
 
 	// --- switching views ---------------------------------------------------
@@ -373,9 +637,9 @@ export default class NoteCardsPlugin extends Plugin {
 		const button = toolbox.createDiv("canvas-card-menu-button mod-draggable note-card-create");
 		setIcon(button, "file-plus");
 		setTooltip(button, "Drag to add new note", { placement: "top" });
-		button.addEventListener("click", () => this.promptNewNote(canvas, canvas.posCenter(), true));
+		button.addEventListener("click", () => void this.addNewNote(canvas, canvas.posCenter(), true));
 		button.addEventListener("pointerdown", (evt) =>
-			canvas.dragTempNode(evt, this.newNodeSize(canvas), (pos) => this.promptNewNote(canvas, pos, false)),
+			canvas.dragTempNode(evt, this.newNodeSize(canvas), (pos) => void this.addNewNote(canvas, pos, false)),
 		);
 	}
 
@@ -383,72 +647,82 @@ export default class NoteCardsPlugin extends Plugin {
 		return this.settings.defaultView === "card" ? CARD_SIZE : canvas.config.defaultFileNodeDimensions;
 	}
 
-	private promptNewNote(canvas: Canvas, pos: Pos, centered: boolean) {
-		new NoteNameModal(this.app, async (name) => {
-			try {
-				const file = await this.createNote(canvas, name);
-				canvas.createFileNode({
-					pos,
-					size: this.newNodeSize(canvas),
-					position: centered ? "center" : undefined,
-					file,
-				});
-			} catch (err) {
-				new Notice(`Could not create note: ${err instanceof Error ? err.message : err}`);
-			}
-		}).open();
+	/**
+	 * Creates an "Untitled" note on the canvas and starts editing it right away.
+	 * Card view: the title is edited in the card, and leaving it empty (or Esc) drops the note again.
+	 * Note view: the embedded editor opens, as if the node was double-clicked.
+	 */
+	private async addNewNote(canvas: Canvas, pos: Pos, centered: boolean) {
+		if (canvas.readonly) return;
+		let file: TFile;
+		try {
+			file = await this.createNote(canvas, "Untitled");
+		} catch (err) {
+			new Notice(`Could not create note: ${errorMessage(err)}`);
+			return;
+		}
+		const asCard = this.settings.defaultView === "card";
+		const node = canvas.createFileNode({
+			pos,
+			size: this.newNodeSize(canvas),
+			position: centered ? "center" : undefined,
+			file,
+			save: !asCard, // a card is only saved once it got a name
+		});
+		node.attach();
+		node.render();
+
+		if (!asCard) {
+			// give the embed a moment to load the (empty) file
+			window.setTimeout(() => {
+				node.startEditing();
+				node.child?.focusTitle?.();
+			}, 100);
+			return;
+		}
+		this.startTitleEdit(
+			node,
+			"",
+			(name) => void this.nameNewNote(canvas, file, name),
+			() => void this.dropNewNote(canvas, node, file),
+		);
+	}
+
+	private async nameNewNote(canvas: Canvas, file: TFile, name: string) {
+		try {
+			await this.app.fileManager.renameFile(file, this.availablePath(file.parent?.path ?? "/", name));
+		} catch (err) {
+			new Notice(`Could not name note "${name}", kept it as "${file.basename}": ${errorMessage(err)}`);
+		}
+		canvas.requestSave();
+	}
+
+	private async dropNewNote(canvas: Canvas, node: CanvasNode, file: TFile) {
+		canvas.removeNode(node);
+		// only ever delete the placeholder we just created
+		if ((await this.app.vault.read(file)) === "") await this.app.vault.delete(file);
+	}
+
+	private availablePath(folder: string, name: string): string {
+		const base = folder === "/" || folder === "" ? name : `${folder}/${name}`;
+		let path = normalizePath(`${base}.md`);
+		for (let i = 1; this.app.vault.getAbstractFileByPath(path); i++) {
+			path = normalizePath(`${base} ${i}.md`);
+		}
+		return path;
 	}
 
 	private async createNote(canvas: Canvas, name: string): Promise<TFile> {
 		// Honors Settings -> Files and links -> Default location for new notes,
 		// same as the built-in "Convert to file...".
 		const parent = this.app.fileManager.getNewFileParent(canvas.view.file?.path ?? "", name);
-		const base = parent.isRoot() ? name : `${parent.path}/${name}`;
-		let path = normalizePath(`${base}.md`);
-		for (let i = 1; this.app.vault.getAbstractFileByPath(path); i++) {
-			path = normalizePath(`${base} ${i}.md`);
-		}
-		return this.app.vault.create(path, "");
+		return this.app.vault.create(this.availablePath(parent.path, name), "");
 	}
 }
 
-class NoteNameModal extends Modal {
-	constructor(
-		app: App,
-		private onSubmit: (name: string) => void,
-	) {
-		super(app);
-	}
-
-	onOpen() {
-		this.titleEl.setText("New note");
-		let name = "";
-		const submit = () => {
-			this.close();
-			this.onSubmit(name.trim() || "Untitled");
-		};
-		new Setting(this.contentEl)
-			.setName("Name")
-			.addText((text) => {
-				text.setPlaceholder("Untitled").onChange((value) => (name = value));
-				text.inputEl.addEventListener("keydown", (evt) => {
-					if (evt.key === "Enter" && !evt.isComposing) {
-						evt.preventDefault();
-						submit();
-					}
-				});
-				window.setTimeout(() => text.inputEl.focus());
-			})
-			.addButton((button) => button.setButtonText("Create").setCta().onClick(submit));
-	}
-
-	onClose() {
-		this.contentEl.empty();
-	}
-}
-
-class PreviewModal extends Modal {
-	private component = new Component();
+/** The note (or the section a node is narrowed to) as an editable document in a modal. */
+class NoteModal extends Modal {
+	private embed: MarkdownEmbed | null = null;
 
 	constructor(
 		app: App,
@@ -459,25 +733,43 @@ class PreviewModal extends Modal {
 	}
 
 	async onOpen() {
-		const { file, subpath } = this;
-		this.modalEl.addClass("note-card-preview");
-		this.titleEl.setText(subpath ? `${file.basename} › ${subpath.substring(1)}` : file.basename);
-		this.component.load();
+		const { app, file, subpath } = this;
+		this.modalEl.addClass("note-card-modal");
+		if (subpath) this.titleEl.setText(`${file.basename} › ${subpath.substring(1)}`);
 
-		let markdown = await this.app.vault.cachedRead(file);
-		const cache = this.app.metadataCache.getFileCache(file);
-		const section = subpath && cache ? resolveSubpath(cache, subpath) : null;
-		if (section) {
-			markdown = markdown.slice(section.start.offset, section.end?.offset);
-		} else if (cache?.frontmatterPosition) {
-			markdown = markdown.slice(cache.frontmatterPosition.end.offset);
+		try {
+			const createEmbed = (app as unknown as { embedRegistry: { embedByExtension: Record<string, EmbedCreator> } })
+				.embedRegistry.embedByExtension.md;
+			const containerEl = this.contentEl.createDiv();
+			const embed = createEmbed({ app, linktext: file.path + subpath, sourcePath: "", containerEl, depth: 0 }, file, subpath);
+			this.embed = embed;
+			embed.editable = true;
+			embed.load();
+			await embed.loadFile();
+			if (this.embed !== embed) return; // closed in the meantime
+			embed.showEditor();
+			app.workspace.activeEditor = embed as unknown as MarkdownFileInfo;
+		} catch (err) {
+			console.error("Note Cards: could not open the note editor", err);
+			new Notice("Could not open the note editor in this version of Obsidian.");
+			this.close();
 		}
-		const body = this.contentEl.createDiv("markdown-rendered");
-		await MarkdownRenderer.render(this.app, markdown, body, file.path, this.component);
+	}
+
+	close() {
+		// commit a title rename that is still being typed
+		const active = this.modalEl.doc.activeElement;
+		if (active instanceof HTMLElement && this.modalEl.contains(active)) active.blur();
+		super.close();
 	}
 
 	onClose() {
-		this.component.unload();
+		const embed = this.embed;
+		this.embed = null;
+		if (embed) {
+			embed.showPreview(true); // flushes unsaved edits
+			embed.unload();
+		}
 		this.contentEl.empty();
 	}
 }

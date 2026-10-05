@@ -42,6 +42,35 @@
 	display: flex;
 }
 
-.modal.note-card-preview {
+.note-card-title[contenteditable]:not([contenteditable="false"]) {
+	display: block;
+	min-width: 4em;
+	outline: none;
+	cursor: text;
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+/* Editable note modal */
+.modal.note-card-modal {
 	width: min(800px, 90vw);
+	height: 80vh;
+}
+
+.note-card-modal .modal-content {
+	overflow: auto;
+}
+
+.note-card-modal .markdown-embed {
+	border: none;
+	padding: 0;
+}
+
+.note-card-modal .markdown-embed > .markdown-embed-link {
+	display: none;
+}
+
+/* the title is the modal's header, so show it even if inline titles are turned off */
+body:not(.show-inline-title) .note-card-modal .inline-title:not([data-level]) {
+	display: block;
 }

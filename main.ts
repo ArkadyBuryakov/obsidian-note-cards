@@ -404,6 +404,7 @@ export default class NoteCardsPlugin extends Plugin {
 		});
 		leaf ??= this.app.workspace.getLeaf("tab");
 		await leaf.openFile(file, { active: true, eState: subpath ? { subpath } : undefined });
+		await this.app.workspace.revealLeaf(leaf);
 	}
 
 	// --- editing the card title --------------------------------------------
@@ -717,7 +718,7 @@ export default class NoteCardsPlugin extends Plugin {
 	private async dropNewNote(canvas: Canvas, node: CanvasNode, file: TFile) {
 		canvas.removeNode(node);
 		// only ever delete the placeholder we just created
-		if ((await this.app.vault.read(file)) === "") await this.app.vault.delete(file);
+		if ((await this.app.vault.read(file)) === "") await this.app.fileManager.trashFile(file);
 	}
 
 	private availablePath(folder: string, name: string): string {

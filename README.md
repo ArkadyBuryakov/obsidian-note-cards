@@ -40,6 +40,7 @@ Canvas has no official plugin API, so this plugin relies on undocumented Obsidia
 ```sh
 npm install
 npm run dev    # watch and rebuild main.js
+npm run lint   # the rules the Obsidian community directory checks
 npm run build  # typecheck and produce a minified main.js
 ```
 

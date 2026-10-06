@@ -2,6 +2,7 @@ import { around } from "monkey-around";
 import {
 	App,
 	Component,
+	EventRef,
 	ItemView,
 	MarkdownFileInfo,
 	Menu,
@@ -10,6 +11,7 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	SettingDefinitionItem,
 	TFile,
 	WorkspaceLeaf,
 	normalizePath,
@@ -72,6 +74,10 @@ interface MarkdownEmbed extends Component {
 	showEditor(): void;
 	showPreview(save?: boolean): void;
 	focusTitle(): void;
+}
+interface CanvasWorkspaceEvents {
+	on(name: "canvas:node-menu", callback: (menu: Menu, node: CanvasNode) => void): EventRef;
+	on(name: "canvas:selection-menu", callback: (menu: Menu, canvas: Canvas) => void): EventRef;
 }
 interface SubpathUpdater {
 	renameSubpath?(file: TFile, oldSubpath: string, newSubpath: string): Promise<void>;
@@ -160,7 +166,8 @@ export default class NoteCardsPlugin extends Plugin {
 	private nodePatched = false;
 
 	async onload() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = (await this.loadData()) as Partial<NoteCardsSettings> | null;
+		this.settings = { ...DEFAULT_SETTINGS, ...saved };
 		this.addSettingTab(new NoteCardsSettingTab(this.app, this));
 
 		this.addCommand({
@@ -176,8 +183,8 @@ export default class NoteCardsPlugin extends Plugin {
 			},
 		});
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const workspace = this.app.workspace as any;
+		// canvas events are not part of the public Workspace typings
+		const workspace = this.app.workspace as unknown as CanvasWorkspaceEvents;
 		this.registerEvent(
 			workspace.on("canvas:node-menu", (menu: Menu, node: CanvasNode) => {
 				if (!node.canvas.readonly && isNoteNode(node)) this.addMenuItem(menu, [node]);
@@ -237,7 +244,7 @@ export default class NoteCardsPlugin extends Plugin {
 	private patchCanvas(canvas: Canvas) {
 		if (this.canvasPatched) return;
 		this.canvasPatched = true;
-		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		// eslint-disable-next-line @typescript-eslint/no-this-alias -- patched methods are called with the canvas object as "this"
 		const plugin = this;
 
 		this.register(
@@ -291,7 +298,7 @@ export default class NoteCardsPlugin extends Plugin {
 	private patchNode(node: CanvasNode) {
 		if (this.nodePatched || node.filePath === undefined) return;
 		this.nodePatched = true;
-		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		// eslint-disable-next-line @typescript-eslint/no-this-alias -- patched methods are called with the canvas object as "this"
 		const plugin = this;
 
 		this.register(
@@ -397,7 +404,6 @@ export default class NoteCardsPlugin extends Plugin {
 		});
 		leaf ??= this.app.workspace.getLeaf("tab");
 		await leaf.openFile(file, { active: true, eState: subpath ? { subpath } : undefined });
-		await this.app.workspace.revealLeaf(leaf);
 	}
 
 	// --- editing the card title --------------------------------------------
@@ -473,6 +479,17 @@ export default class NoteCardsPlugin extends Plugin {
 		}
 	}
 
+	/** Notes with at least one link to the file, plus the file itself (for "[[#Heading]]" links). */
+	private filesLinkingTo(file: TFile): TFile[] {
+		const sources = new Set<TFile>([file]);
+		for (const [sourcePath, targets] of Object.entries(this.app.metadataCache.resolvedLinks)) {
+			if (!(file.path in targets)) continue;
+			const source = this.app.vault.getAbstractFileByPath(sourcePath);
+			if (source instanceof TFile) sources.add(source);
+		}
+		return [...sources];
+	}
+
 	private resolveHeading(file: TFile, subpath: string) {
 		const cache = this.app.metadataCache.getFileCache(file);
 		const result = cache ? resolveSubpath(cache, subpath) : null;
@@ -501,7 +518,7 @@ export default class NoteCardsPlugin extends Plugin {
 		// links to the heading, per source file
 		const edits = new Map<TFile, TextEdit[]>();
 		let linkCount = 0;
-		for (const source of vault.getMarkdownFiles()) {
+		for (const source of this.filesLinkingTo(file)) {
 			const cache = metadataCache.getFileCache(source);
 			for (const ref of [...(cache?.links ?? []), ...(cache?.embeds ?? [])]) {
 				const { path, subpath } = parseLinktext(ref.link);
@@ -774,6 +791,10 @@ class NoteModal extends Modal {
 	}
 }
 
+const SETTING_NAME = "Default note view";
+const SETTING_DESC = "View for notes newly added to a canvas. Notes already on a canvas are not affected.";
+const VIEW_OPTIONS: Record<NodeView, string> = { note: "Note", card: "Card" };
+
 class NoteCardsSettingTab extends PluginSettingTab {
 	constructor(
 		app: App,
@@ -782,15 +803,30 @@ class NoteCardsSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		return [
+			{
+				name: SETTING_NAME,
+				desc: SETTING_DESC,
+				control: {
+					type: "dropdown",
+					key: "defaultView",
+					defaultValue: DEFAULT_SETTINGS.defaultView,
+					options: VIEW_OPTIONS,
+				},
+			},
+		];
+	}
+
+	/** Fallback for Obsidian versions before 1.13.0, which do not know getSettingDefinitions(). */
 	display() {
 		this.containerEl.empty();
 		new Setting(this.containerEl)
-			.setName("Default note view")
-			.setDesc("View for notes newly added to a canvas. Notes already on a canvas are not affected.")
+			.setName(SETTING_NAME)
+			.setDesc(SETTING_DESC)
 			.addDropdown((dropdown) =>
 				dropdown
-					.addOption("note", "Note")
-					.addOption("card", "Card")
+					.addOptions(VIEW_OPTIONS)
 					.setValue(this.plugin.settings.defaultView)
 					.onChange(async (value) => {
 						this.plugin.settings.defaultView = value as NodeView;

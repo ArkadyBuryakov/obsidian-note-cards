@@ -3,7 +3,7 @@
   "name": "Note Cards",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Show canvas notes as compact title cards, with quick preview and a create-note toolbox button.",
+  "description": "Show canvas notes as compact title cards that you can rename in place, edit in a modal, and create right on the canvas.",
   "author": "Arkady Buryakov",
-  "isDesktopOnly": false
+  "isDesktopOnly": true
 }
